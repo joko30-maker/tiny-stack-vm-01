@@ -1,0 +1,92 @@
+// A tiny stack VM for make.fun's tiny stack ISA v1 (wrapping 32-bit ints, 256-value stack,
+// 64-deep call stack, 256 words of memory, byte I/O, the ISA's traps). Answers every instance
+// under /input with /output/<id>/stdout.bin and /output/<id>/exit.txt.
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+// Per-opcode [immediate bytes, popped, pushed]; 0x10..0x22 are binary (unary two corrected).
+const T = [];
+for (let b = 16; b <= 34; b++) T[b] = [0, 2, 1];
+T[23] = T[27] = [0, 1, 1];
+Object.assign(T, { 0: [0, 0, 0], 1: [1, 0, 1], 2: [4, 0, 1], 3: [0, 1, 0], 4: [0, 1, 2], 5: [0, 2, 2], 6: [0, 2, 3], 7: [0, 3, 3], 48: [2, 0, 0], 49: [2, 1, 0], 50: [2, 1, 0], 51: [2, 0, 0], 52: [0, 0, 0], 64: [0, 1, 1], 65: [0, 2, 0], 80: [0, 1, 0], 81: [0, 1, 0], 82: [0, 0, 1], 83: [0, 1, 0] });
+// Binary operators by opcode; Z is the divide-by-zero sentinel (the caller turns it into trap 4).
+const Z = {};
+const F = { 16: (a, b) => (a + b) | 0, 17: (a, b) => (a - b) | 0, 18: (a, b) => Math.imul(a, b), 19: (a, b) => b === 0 ? Z : a === -2147483648 && b === -1 ? a : (a / b) | 0, 20: (a, b) => b === 0 ? Z : b === -1 ? 0 : a % b | 0, 21: (a, b) => b === 0 ? Z : Math.floor((a >>> 0) / (b >>> 0)) | 0, 22: (a, b) => b === 0 ? Z : (a >>> 0) % (b >>> 0) | 0, 24: (a, b) => a & b, 25: (a, b) => a | b, 26: (a, b) => a ^ b, 28: (a, b) => a << (b & 31), 29: (a, b) => a >> (b & 31), 30: (a, b) => (a >>> (b & 31)) | 0, 32: (a, b) => a === b ? 1 : 0, 33: (a, b) => a < b ? 1 : 0, 34: (a, b) => (a >>> 0) < (b >>> 0) ? 1 : 0 };
+function run(p, inp) {
+  const D = new Int32Array(256), C = new Int32Array(64), M = new Int32Array(256), out = new Uint8Array(65536);
+  let sp = 0, csp = 0, olen = 0, ip = 0, pc = 0, steps = 0;
+  const n = p.length, end = (code) => [out.subarray(0, olen), code];
+  for (;;) {
+    if (steps === 1e6) return end(10);
+    if (pc < 0 || pc >= n) return end(9);
+    const op = p[pc], t = T[op];
+    if (t === undefined) return end(5);
+    const [imm, pops, pushes] = t;
+    if (pc + imm >= n) return end(9);
+    steps++;
+    if (sp < pops) return end(2);
+    if (sp - pops + pushes > 256) return end(3);
+    const next = pc + 1 + imm;
+    pc = next;
+    if (F[op] !== undefined) {
+      const r = F[op](D[sp - 2], D[sp - 1]);
+      if (r === Z) return end(4);
+      D[sp - 2] = r; sp--;
+      continue;
+    }
+    switch (op) {
+      case 0: return end(0);
+      case 1: D[sp++] = (p[next - 1] << 24) >> 24; break;
+      case 2: D[sp++] = p[next - 4] | (p[next - 3] << 8) | (p[next - 2] << 16) | (p[next - 1] << 24); break;
+      case 3: sp--; break;
+      case 4: D[sp] = D[sp - 1]; sp++; break;
+      case 5: { const v = D[sp - 1]; D[sp - 1] = D[sp - 2]; D[sp - 2] = v; break; }
+      case 6: D[sp] = D[sp - 2]; sp++; break;
+      case 7: { const a = D[sp - 3]; D[sp - 3] = D[sp - 2]; D[sp - 2] = D[sp - 1]; D[sp - 1] = a; break; }
+      case 23: D[sp - 1] = -D[sp - 1] | 0; break;
+      case 27: D[sp - 1] = ~D[sp - 1]; break;
+      case 48: case 49: case 50: {
+        const rel = ((p[next - 2] | (p[next - 1] << 8)) << 16) >> 16;
+        let take = op === 48;
+        if (!take) { const v = D[--sp]; take = op === 49 ? v === 0 : v !== 0; }
+        if (take) pc = next + rel;
+        break;
+      }
+      case 51:
+        if (csp === 64) return end(7);
+        C[csp++] = next;
+        pc = p[next - 2] | (p[next - 1] << 8);
+        break;
+      case 52:
+        if (csp === 0) return end(8);
+        pc = C[--csp];
+        break;
+      case 64: case 65: {
+        const a = D[sp - 1];
+        if (a < 0 || a > 255) return end(6);
+        if (op === 64) D[sp - 1] = M[a];
+        else { M[a] = D[sp - 2]; sp -= 2; }
+        break;
+      }
+      case 80: {
+        const s = String(D[sp - 1]);
+        if (olen + s.length > 65536) return end(11);
+        sp--;
+        for (let i = 0; i < s.length; i++) out[olen++] = s.charCodeAt(i);
+        break;
+      }
+      case 81:
+        if (olen === 65536) return end(11);
+        out[olen++] = D[--sp] & 255;
+        break;
+      case 82: D[sp++] = ip < inp.length ? inp[ip++] : -1; break;
+      case 83: return end(D[--sp] & 255);
+    }
+  }
+}
+const I = process.env.MAKEFUN_INPUT_DIR ?? '/input', O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+for (const id of readdirSync(I).sort()) {
+  const [bytes, code] = run(readFileSync(join(I, id, 'program.bin')), readFileSync(join(I, id, 'input.bin')));
+  mkdirSync(join(O, id), { recursive: true });
+  writeFileSync(join(O, id, 'stdout.bin'), bytes);
+  writeFileSync(join(O, id, 'exit.txt'), `${code}\n`);
+}
